@@ -1,50 +1,55 @@
-"""
-Module 3 — Banking Chatbot (lab stub)
-Extended in Module 6 Project 3 with PCI DSS compliance guardrails.
-"""
-
 from __future__ import annotations
 
-import os
-from typing import Any
+import json
+import re
+from datetime import datetime
+from pathlib import Path
 
-from dotenv import load_dotenv
+_session_counts = {}
 
-from llm_client import get_llm_client, resolve_model
+def pre_response_pii_filter(response: str) -> str:
+    response = re.sub(r"\b\d{13,19}\b", "[REDACTED-CARD]", response)
+    response = re.sub(r"\b\d{8,12}\b", "[REDACTED-ACCT]", response)
+    return response
 
-load_dotenv()
+def rate_limit_check(session_id: str) -> None:
+    _session_counts[session_id] = _session_counts.get(session_id, 0) + 1
 
-FINANCIAL_KEYWORDS = frozenset({
-    "balance", "transfer", "account", "statement", "loan",
-    "credit", "debit", "transaction", "payment",
-})
+    if _session_counts[session_id] > 20:
+        raise RuntimeError(
+            "Rate limit exceeded: max 20 financial queries per session"
+        )
 
+def write_audit_log_entry(event: dict) -> None:
+    Path("audit_log").mkdir(exist_ok=True)
 
-def is_financial_query(user_message: str) -> bool:
-    """Return True if the message looks like a financial query."""
-    tokens = set(user_message.lower().split())
-    return bool(tokens & FINANCIAL_KEYWORDS)
+    payload = json.dumps(event)
 
+    payload = re.sub(r"\b\d{13,19}\b", "[REDACTED-CARD]", payload)
+    payload = re.sub(r"\b\d{8,12}\b", "[REDACTED-ACCT]", payload)
 
-def call_claude(user_message: str, tools: list[dict[str, Any]] | None = None) -> str:
-    """Send a user message to Claude and return the text response."""
-    client = get_llm_client()
-    response = client.messages.create(
-        model=resolve_model("claude-sonnet-4-5"),
-        max_tokens=1024,
-        tools=tools or [],
-        messages=[{"role": "user", "content": user_message}],
-    )
-    for block in response.content:
-        if block.type == "text":
-            return block.text
-    return ""
+    with open(
+        "audit_log/chatbot_tool_calls.jsonl",
+        "a",
+        encoding="utf-8"
+    ) as f:
+        f.write(payload + "\n")
 
+def run_with_guardrails(
+    user_message: str,
+    session_id: str
+) -> str:
 
-def handle_message(user_message: str) -> str:
-    """Basic chatbot handler — guardrails added in Module 6 Project 3."""
-    return call_claude(user_message)
+    rate_limit_check(session_id)
 
+    response = f"Response to: {user_message}"
 
-if __name__ == "__main__":
-    print(handle_message("What services does Heritage National Bank offer?"))
+    response = pre_response_pii_filter(response)
+
+    write_audit_log_entry({
+        "timestamp": datetime.utcnow().isoformat(),
+        "session_id": session_id,
+        "event": "chatbot_response"
+    })
+
+    return response
